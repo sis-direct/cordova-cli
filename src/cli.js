@@ -30,12 +30,14 @@ var path = require('path'),
     _,
     updateNotifier,
     pkg = require('../package.json'),
-    logger = require('./logger');
+    telemetry = require('./telemetry'),
+    Q = require('q');
 
 var cordova_lib = require('cordova-lib'),
     CordovaError = cordova_lib.CordovaError,
     cordova = cordova_lib.cordova,
-    events = cordova_lib.events;
+    events = cordova_lib.events,
+    logger = require('cordova-common').CordovaLogger.get();
 
 
 /*
@@ -60,16 +62,146 @@ function init() {
 }
 
 function checkForUpdates() {
-    // Checks for available update and returns an instance
-    var notifier = updateNotifier({
-        pkg: pkg
-    });
+    try {
+        // Checks for available update and returns an instance
+        var notifier = updateNotifier({
+            pkg: pkg
+        });
 
-    // Notify using the built-in convenience method
-    notifier.notify();
+        // Notify using the built-in convenience method
+        notifier.notify();
+    } catch (e) {
+        // https://issues.apache.org/jira/browse/CB-10062
+        if (e && e.message && /EACCES/.test(e.message)) {
+            console.log('Update notifier was not able to access the config file.\n' +
+                'You may grant permissions to the file: \'sudo chmod 744 ~/.config/configstore/update-notifier-cordova.json\'');
+        } else {
+            throw e;
+        }
+    }
 }
 
-module.exports = cli;
+var shouldCollectTelemetry = false;
+module.exports = function (inputArgs, cb) {
+    
+    /**
+     * mainly used for testing.
+     */
+    cb = cb || function(){};
+    
+    init();
+    
+    // If no inputArgs given, use process.argv.
+    inputArgs = inputArgs || process.argv;
+    var cmd = inputArgs[2]; // e.g: inputArgs= 'node cordova run ios'
+    var subcommand = getSubCommand(inputArgs, cmd);
+    var isTelemetryCmd = (cmd === 'telemetry');
+
+    // ToDO: Move nopt-based parsing of args up here
+    if(cmd === '--version' || cmd === '-v') {
+        cmd = 'version';
+    } else if(!cmd || cmd === '--help' || cmd === 'h') {
+        cmd = 'help';
+    }
+            
+    Q().then(function() {
+        
+        /**
+         * Skip telemetry prompt if:
+         * - CI environment variable is present
+         * - Command is run with `--no-telemetry` flag
+         * - Command ran is: `cordova telemetry on | off | ...`
+         */
+        
+        if(telemetry.isCI(process.env) || telemetry.isNoTelemetryFlag(inputArgs)) {
+            return Q(false);
+        }
+        
+        /**
+         * We shouldn't prompt for telemetry if user issues a command of the form: `cordova telemetry on | off | ...x`
+         * Also, if the user has already been prompted and made a decision, use his saved answer
+         */
+        if(isTelemetryCmd) {
+            var isOptedIn = telemetry.isOptedIn();
+            return handleTelemetryCmd(subcommand, isOptedIn);
+        }
+        
+        if(telemetry.hasUserOptedInOrOut()) {
+            return Q(telemetry.isOptedIn());
+        }
+        
+        /**
+         * Otherwise, prompt user to opt-in or out
+         * Note: the prompt is shown for 30 seconds. If no choice is made by that time, User is considered to have opted out.
+         */
+        return telemetry.showPrompt();
+    }).then(function (collectTelemetry) {
+        shouldCollectTelemetry = collectTelemetry;
+        if(isTelemetryCmd) {
+            return Q();
+        }
+        return cli(inputArgs);
+    }).then(function () {
+        if (shouldCollectTelemetry && !isTelemetryCmd) {
+            telemetry.track(cmd, subcommand, 'successful');
+        }
+        // call cb with error as arg if something failed
+        cb(null);
+    }).fail(function (err) {
+        if (shouldCollectTelemetry && !isTelemetryCmd) {
+            telemetry.track(cmd, subcommand, 'unsuccessful');
+        }
+        // call cb with error as arg if something failed
+        cb(err);
+        throw err;
+    }).done();
+};
+
+function getSubCommand(args, cmd) {
+    if(cmd === 'platform' || cmd === 'platforms' || cmd === 'plugin' || cmd === 'plugins' || cmd === 'telemetry') {
+        return args[3]; // e.g: args='node cordova platform rm ios', 'node cordova telemetry on'
+    }
+    return null;
+}
+
+function handleTelemetryCmd(subcommand, isOptedIn) {
+    
+    if (subcommand !== 'on' && subcommand !== 'off') {
+        logger.subscribe(events);
+        return help(['telemetry']);
+    }
+    
+    var turnOn = subcommand === 'on' ? true : false;
+    var cmdSuccess = true;
+
+    // turn telemetry on or off
+    try {
+        if (turnOn) {
+            telemetry.turnOn();
+            console.log("Thanks for opting into telemetry to help us improve cordova.");
+        } else {
+            telemetry.turnOff();
+            console.log("You have been opted out of telemetry. To change this, run: cordova telemetry on.");
+        }
+    } catch (ex) {
+        cmdSuccess = false;
+    }
+
+    // track or not track ?, that is the question
+
+    if (!turnOn) {
+        // Always track telemetry opt-outs (whether user opted out or not!)
+        telemetry.track('telemetry', 'off', 'via-cordova-telemetry-cmd', cmdSuccess ? 'successful': 'unsuccessful');
+        return Q();
+    }
+    
+    if(isOptedIn) {
+        telemetry.track('telemetry', 'on', 'via-cordova-telemetry-cmd', cmdSuccess ? 'successful' : 'unsuccessful');
+    }
+    
+    return Q();
+}
+
 function cli(inputArgs) {
     // When changing command line arguments, update doc/help.txt accordingly.
     var knownOpts =
@@ -86,6 +218,7 @@ function cli(inputArgs) {
         , 'searchpath' : String
         , 'variable' : Array
         , 'link': Boolean
+        , 'force': Boolean
         // Flags to be passed to `cordova build/run/emulate`
         , 'debug' : Boolean
         , 'release' : Boolean
@@ -94,6 +227,8 @@ function cli(inputArgs) {
         , 'emulator': Boolean
         , 'target' : String
         , 'browserify': Boolean
+        , 'noprepare': Boolean
+        , 'fetch': Boolean
         , 'nobuild': Boolean
         , 'list': Boolean
         , 'buildConfig' : String
@@ -108,41 +243,22 @@ function cli(inputArgs) {
         , 't' : '--template'
         };
 
-    // If no inputArgs given, use process.argv.
-    inputArgs = inputArgs || process.argv;
-
-    init();
-
     checkForUpdates();
 
     var args = nopt(knownOpts, shortHands, inputArgs);
-
-    if (args.version) {
-        var cliVersion = require('../package').version;
-        var libVersion = require('cordova-lib/package').version;
-        var toPrint = cliVersion;
-        if (cliVersion != libVersion || /-dev$/.exec(libVersion)) {
-            toPrint += ' (cordova-lib@' + libVersion + ')';
-        }
-        console.log(toPrint);
-        return;
-    }
-
 
     // For CordovaError print only the message without stack trace unless we
     // are in a verbose mode.
     process.on('uncaughtException', function(err) {
         logger.error(err);
+        // Don't send exception details, just send that it happened
+        if(shouldCollectTelemetry) {
+            telemetry.track('uncaughtException');
+        }
         process.exit(1);
     });
 
-    events.on('verbose', logger.verbose);
-    events.on('log', logger.normal);
-    events.on('info', logger.info);
-    events.on('warn', logger.warn);
-
-    // Set up event handlers for logging and results emitted as events.
-    events.on('results', logger.results);
+    logger.subscribe(events);
 
     if (args.silent) {
         logger.setLevel('error');
@@ -152,7 +268,25 @@ function cli(inputArgs) {
         logger.setLevel('verbose');
     }
 
-    // TODO: Example wanted, is this functionality ever used?
+    var cliVersion = require('../package').version;
+    // TODO: Use semver.prerelease when it gets released
+    var usingPrerelease = /-nightly|-dev$/.exec(cliVersion);
+    if (args.version || usingPrerelease) {
+        var libVersion = require('cordova-lib/package').version;
+        var toPrint = cliVersion;
+        if (cliVersion != libVersion || usingPrerelease) {
+            toPrint += ' (cordova-lib@' + libVersion + ')';
+        }
+
+        if (args.version) {
+            logger.results(toPrint);
+            return Q();
+        } else {
+            // Show a warning and continue
+            logger.warn('Warning: using prerelease version ' + toPrint);
+        }
+    }
+
     // If there were arguments protected from nopt with a double dash, keep
     // them in unparsedArgs. For example:
     // cordova build ios -- --verbose --whatever
@@ -195,9 +329,11 @@ function cli(inputArgs) {
         verbose: args.verbose || false,
         silent: args.silent || false,
         browserify: args.browserify || false,
+        fetch: args.fetch || false,
         nohooks: args.nohooks || [],
         searchpath : args.searchpath
     };
+
 
     if (cmd == 'emulate' || cmd == 'build' || cmd == 'prepare' || cmd == 'compile' || cmd == 'run' || cmd === 'clean') {
         // All options without dashes are assumed to be platform names
@@ -212,12 +348,11 @@ function cli(inputArgs) {
         opts.options = args;
         opts.options.argv = unparsedArgs;
 
-        if (cmd == 'run' && args.list && cordova.raw.targets) {
-            cordova.raw.targets.call(null, opts).done();
-            return;
+        if (cmd === 'run' && args.list && cordova.raw.targets) {
+            return cordova.raw.targets.call(null, opts);
         }
 
-        cordova.raw[cmd].call(null, opts).done();
+        return cordova.raw[cmd].call(null, opts);
     } else if (cmd === 'requirements') {
         // All options without dashes are assumed to be platform names
         opts.platforms = undashed.slice(1);
@@ -227,41 +362,41 @@ function cli(inputArgs) {
             throw new CordovaError(msg);
         }
 
-        cordova.raw[cmd].call(null, opts.platforms)
-        .then(function (platformChecks) {
+        return cordova.raw[cmd].call(null, opts.platforms)
+            .then(function(platformChecks) {
 
-            var someChecksFailed = Object.keys(platformChecks).map(function (platformName) {
-                events.emit('log', '\nRequirements check results for ' + platformName + ':');
-                var platformCheck = platformChecks[platformName];
-                if (platformCheck instanceof CordovaError) {
-                    events.emit('warn', 'Check failed for ' + platformName + ' due to ' + platformCheck);
-                    return true;
-                }
-
-                var someChecksFailed = false;
-                platformCheck.forEach(function (checkItem) {
-                    var checkSummary = checkItem.name + ': ' +
-                                    (checkItem.installed ? 'installed ' : 'not installed ') +
-                                    (checkItem.metadata.version || '');
-                    events.emit('log', checkSummary);
-                    if (!checkItem.installed) {
-                        someChecksFailed = true;
-                        events.emit('warn', checkItem.metadata.reason);
+                var someChecksFailed = Object.keys(platformChecks).map(function(platformName) {
+                    events.emit('log', '\nRequirements check results for ' + platformName + ':');
+                    var platformCheck = platformChecks[platformName];
+                    if (platformCheck instanceof CordovaError) {
+                        events.emit('warn', 'Check failed for ' + platformName + ' due to ' + platformCheck);
+                        return true;
                     }
+
+                    var someChecksFailed = false;
+                    platformCheck.forEach(function(checkItem) {
+                        var checkSummary = checkItem.name + ': ' +
+                            (checkItem.installed ? 'installed ' : 'not installed ') +
+                            (checkItem.metadata.version || '');
+                        events.emit('log', checkSummary);
+                        if (!checkItem.installed) {
+                            someChecksFailed = true;
+                            events.emit('warn', checkItem.metadata.reason);
+                        }
+                    });
+
+                    return someChecksFailed;
+                }).some(function(isCheckFailedForPlatform) {
+                    return isCheckFailedForPlatform;
                 });
 
-                return someChecksFailed;
-            }).some(function (isCheckFailedForPlatform) {
-                return isCheckFailedForPlatform;
+                if (someChecksFailed) throw new CordovaError('Some of requirements check failed');
             });
-
-            if (someChecksFailed) throw new CordovaError('Some of requirements check failed');
-        }).done();
     } else if (cmd == 'serve') {
         var port = undashed[1];
-        cordova.raw.serve(port).done();
+        return cordova.raw.serve(port);
     } else if (cmd == 'create') {
-        create();
+        return create();
     } else {
         // platform/plugins add/rm [target(s)]
         subcommand = undashed[1]; // sub-command like "add", "ls", "rm" etc.
@@ -283,11 +418,13 @@ function cli(inputArgs) {
                             , nohooks : args.nohooks
                             , cli_variables : cli_vars
                             , browserify: args.browserify || false
+                            , fetch: args.fetch || false
                             , link: args.link || false
                             , save: args.save || false
                             , shrinkwrap: args.shrinkwrap || false
+                            , force: args.force || false
                             };
-        cordova.raw[cmd](subcommand, targets, download_opts).done();
+        return cordova.raw[cmd](subcommand, targets, download_opts);
     }
 
     function create() {
@@ -304,9 +441,9 @@ function cli(inputArgs) {
         customWww = args['copy-from'] || args['link-to'] || args.template;
 
         if (customWww) {
-            if (!args.template && customWww.indexOf('http') === 0) {
+            if (!args.template && !args['copy-from'] && customWww.indexOf('http') === 0) {
                 throw new CordovaError(
-                    'Only local paths for custom www assets are supported.'
+                    'Only local paths for custom www assets are supported for linking' + customWww
                 );
             }
 
@@ -316,23 +453,28 @@ function cli(inputArgs) {
 
             wwwCfg = {
                 url: customWww,
-                template: false
+                template: false,
+                link: false
             };
 
-            if (args['link-to'])
+            if (args['link-to']) {
                 wwwCfg.link = true;
-            else if (args.template)
+            }
+            if (args.template) {
                 wwwCfg.template = true;
+            } else if (args['copy-from']) {
+                logger.warn('Warning: --copy-from option is being deprecated. Consider using --template instead.');
+                wwwCfg.template = true;
+            }
 
             cfg.lib = cfg.lib || {};
             cfg.lib.www = wwwCfg;
         }
-
-        // create(dir, id, name, cfg)
-        cordova.raw.create( undashed[1]  // dir to create the project in
+        return cordova.raw.create( undashed[1]  // dir to create the project in
             , undashed[2]  // App id
             , undashed[3]  // App name
             , cfg
-        ).done();
+            , events || undefined
+        );
     }
 }
